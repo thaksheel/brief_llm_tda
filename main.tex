@@ -1,0 +1,198 @@
+\documentclass{article}
+% \usepackage{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx} % Required for inserting images
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{xcolor}         % colors
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[ backend=biber, style=authoryear ]{biblatex}
+% \addbibresource{./HW6-W48/references.bib}
+\addbibresource{references.bib}
+
+% Shared notation macros (keep symbols identical across the document)
+\newcommand{\hth}{\hat{\theta}}                 % empirical risk minimizer
+\newcommand{\Hh}{H_{\hat{\theta}}}              % Hessian of the empirical risk at \hat{\theta}
+\newcommand{\gr}[1]{g(#1)}                      % per-example gradient at \hat{\theta}
+\newcommand{\gt}[1]{\tilde{g}(#1)}              % randomly projected gradient, P g(#1)
+\newcommand{\gtr}[1]{\tilde{g}_r(#1)}           % rank-r coordinates, V_r^\top \tilde{g}(#1)
+
+\title{Training Data Attribution for LLMs: Recovering Model Outputs from Training Samples}
+\author{Thaksheel Alleck}
+\date{\today}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+    Training Data Attribution (TDA) identifies the training examples that drive a model's predictions, supporting safety, data auditing, and fact tracing for large language models. This review surveys the influence-function family of TDA methods. We first derive the mathematical background shared by these methods, including the Taylor expansion of the perturbed minimizer, the role of the Hessian, the influence function, random projection, truncated SVD, and the Woodbury identity. We then review influence functions, TracIn, and LoRIF, highlighting how each makes influence computation tractable: TracIn avoids the Hessian through gradient similarity across checkpoints, and LoRIF exploits low-rank structure in gradients and curvature. We close with open questions about the faithfulness of these approximations at frontier scale and their extension to multimodal models.
+\end{abstract}
+
+\section{Introduction}
+Understanding the relationship between training data and model predictions is a fundamental challenge in modern machine learning since it allows us to understand "Why did the system make this prediction?" \parencite{influence-functions-2017}. This allows use to improve the model \parencite{abadi2016large}, discover new science \parencite{shrikumar2017learning}, and provide researchers with explanations of model performance \parencite{goodman2017european}.
+
+As large language models (LLMs) become foundational to safety-critical and copyright-sensitive applications, understanding which training examples drive a model's behavior has become essential. Training Data Attribution (TDA) methods address this problem by estimating the contribution of individual training examples to a model's outputs. Classical influence functions \parencite{influence-functions-2017} provided the first theoretically grounded framework for approximating training-example influence through Hessian-based sensitivity analysis. Subsequent work extended these ideas to large language models (LLMs), introducing fact-tracing benchmarks and scalable approximations such as TracIn \parencite{tracein} and TRAK \parencite{trak} that replaced expensive second-order computations with efficient gradient-based representations. Recent methods further improved attribution quality and scalability through optimizer-aware corrections, random projections, and causal influence formulations, as exemplified by TrackStar \parencite{trackstar}. Most recently, LoRIF \parencite{loRIF} introduced low-rank approximations of both gradients and curvature information, enabling influence-based attribution at unprecedented scales, including LLMs with up to 70B parameters. These advances collectively establish TDA as a promising framework for model interpretability, data auditing, fact tracing, and understanding knowledge acquisition in large-scale foundation models.
+
+Several questions remain open, including whether low-rank and projected approximations stay faithful at frontier scale, and how influence-based attribution extends to multimodal models whose encoders produce gradients on very different scales.
+
+This paper summarises:
+\begin{itemize}
+    \item \textbf{Influence functions} \parencite{influence-functions-2017}: a Hessian-based framework that approximates the effect of upweighting a training example and provides the theoretical basis for the family.
+    \item \textbf{TracIn} \parencite{tracein}: replaces the Hessian with gradient similarity accumulated across training checkpoints, and introduces the fact-tracing task and benchmark for LLMs.
+    \item \textbf{LoRIF} \parencite{loRIF}: exploits low-rank structure in gradients and curvature, using random projection and the Woodbury identity to scale attribution to models with up to 70B parameters.
+\end{itemize}
+
+The remainder of this review first derives the mathematical background shared by these methods, then reviews each one in turn.
+
+
+\section{Math Background}\label{sec:math}
+
+\subsection{Notation}
+\begin{center}
+    \begin{tabular}{@{}ll@{}}
+        \toprule
+        Symbol                                                              & Meaning                                            \\
+        \midrule
+        $\theta\in\mathbb{R}^{D}$                                           & model parameters ($D$ can be in the billions)      \\
+        $\hth$                                                              & empirical risk minimizer (trained parameters)      \\
+        $L(z,\theta)$                                                       & loss of example $z$ at parameters $\theta$         \\
+        $z$                                                                 & a training example                                 \\
+        $z_{test}$                                                          & a test example                                     \\
+        $R(\theta)=\frac{1}{n}\sum_{i=1}^{n}L(z_i,\theta)$                  & empirical risk over $n$ training examples          \\
+        $\gr{z}=\nabla_\theta L(z,\hth)\in\mathbb{R}^{D}$                   & per-example gradient at $\hth$                     \\
+        $\Hh=\nabla^2_\theta R(\hth)\in\mathbb{R}^{D\times D}$              & Hessian of the empirical risk at $\hth$            \\
+        $\epsilon$                                                          & weight placed on one training example              \\
+        $\theta_{t_k}$                                                      & parameters at saved checkpoint $k$ (TracIn)        \\
+        $P\in\mathbb{R}^{p\times D}$, $\gt{z}=P\,\gr{z}\in\mathbb{R}^{p}$   & random projection and projected gradient, $p\ll D$ \\
+        $V_r\in\mathbb{R}^{p\times r}$, $\Sigma_r\in\mathbb{R}^{r\times r}$ & top-$r$ right singular vectors and singular values \\
+        $\gtr{z}=V_r^\top\gt{z}\in\mathbb{R}^{r}$                           & projected gradient in the rank-$r$ subspace        \\
+        $\lambda>0$                                                         & damping constant                                   \\
+        $\mathbb{I}_{k}$                                                    & $k\times k$ identity matrix                        \\
+        $I(z,z_{test})$                                                     & helpful-positive influence of $z$ on $z_{test}$    \\
+        \bottomrule
+    \end{tabular}
+\end{center}
+
+\medskip
+Throughout, $I(z,z_{test})$ is positive when $z$ supports the prediction on $z_{test}$. Koh and Liang's $I_{up,loss}$ measures the change in test loss, so it is the negative of this score.
+
+\subsection{Taylor Expansion}
+Upweighting one training example $z$ by $\epsilon$ gives the perturbed minimizer $\hth_\epsilon=\arg\min_\theta\,R(\theta)+\epsilon\,L(z,\theta)$, which satisfies the stationarity condition
+\begin{equation}\label{eq:stat}
+    \nabla_\theta R(\hth_\epsilon)+\epsilon\,\nabla_\theta L(z,\hth_\epsilon)=0.
+\end{equation}
+Since $\nabla_\theta R(\hth)=0$, a first-order Taylor expansion of the gradient around $\hth$ gives $\nabla_\theta R(\hth_\epsilon)\approx\Hh(\hth_\epsilon-\hth)$. The derivative of a gradient is the Hessian, so this is the vector analogue of $f(x)\approx f(a)+f'(a)(x-a)$.
+
+\subsection{Hessian and Curvature}
+$\Hh$ is symmetric, and at a minimum it is positive semidefinite. Its eigenvalues measure how sharply the loss curves along each eigenvector. Applying $\Hh^{-1}$ shrinks gradient components in high-curvature directions and amplifies those in flat directions. Because $\Hh$ is $D\times D$, it cannot be stored or inverted at LLM scale. Practical methods either use Hessian-vector products $\Hh v$ or, like TracIn and LoRIF, avoid the Hessian.
+
+\subsection{Deriving the Influence Function}
+Substituting the expansion into Equation~(\ref{eq:stat}) and dividing by $\epsilon$, with $\epsilon\,\nabla_\theta L(z,\hth_\epsilon)\approx\epsilon\,\gr{z}$ to first order, gives $\Hh(\hth_\epsilon-\hth)+\epsilon\,\gr{z}\approx0$. Letting $\epsilon\to0$ yields
+\begin{equation}\label{eq:up-params}
+    I_{up,params}(z)=\frac{d\hth_\epsilon}{d\epsilon}\Big|_{\epsilon=0}=-\Hh^{-1}\gr{z}.
+\end{equation}
+By the chain rule, the change in test loss is
+\begin{equation}\label{eq:up-loss}
+    I_{up,loss}(z,z_{test})=\frac{d}{d\epsilon}L(z_{test},\hth_\epsilon)\Big|_{\epsilon=0}=-\gr{z_{test}}^\top\Hh^{-1}\gr{z}.
+\end{equation}
+Flipping the sign gives the helpful score used by TracIn and LoRIF,
+\begin{equation}\label{eq:score}
+    I(z,z_{test})=\gr{z_{test}}^\top\Hh^{-1}\gr{z}.
+\end{equation}
+This is an inner product of the two gradients under the metric $\Hh^{-1}$, so flat directions carry more weight than sharp ones \parencite{influence-functions-2017}.
+
+\subsection{Random Projection}
+Storing a $D$-dimensional gradient for every training example is infeasible at LLM scale. A random matrix $P\in\mathbb{R}^{p\times D}$ with i.i.d.\ Gaussian entries of variance $1/p$ maps $\gr{z}$ to $\gt{z}=P\,\gr{z}$. Since $\mathbb{E}[P^\top P]=\mathbb{I}_D$, the projection is unbiased for inner products, $\mathbb{E}[\gt{z}^\top\gt{z'}]=\gr{z}^\top\gr{z'}$. By the Johnson--Lindenstrauss lemma, for $n$ examples the inner products are preserved up to an additive error of $\varepsilon\|\gr{z}\|\,\|\gr{z'}\|$ with high probability once $p=O(\log n/\varepsilon^2)$\parencite{trak}.
+
+\subsection{Truncated SVD}
+Stack the projected training gradients as rows of $\tilde G\in\mathbb{R}^{n\times p}$, and let $\tilde G/\sqrt{n}=U\Sigma V^\top$ be its singular value decomposition. Keeping the top $r$ singular triplets gives $V_r\in\mathbb{R}^{p\times r}$, with orthonormal columns so that $V_r^\top V_r=\mathbb{I}_r$, and $\Sigma_r\in\mathbb{R}^{r\times r}$. The curvature is then approximated from the projected gradients,
+\begin{equation}\label{eq:lowrank-H}
+    \Hh\approx\frac{1}{n}\tilde G^\top\tilde G\approx V_r\Sigma_r^2V_r^\top,
+\end{equation}
+where the truncated SVD gives the best rank-$r$ approximation in Frobenius norm. This relies on the gradients being approximately low rank. The exact estimator and the choice of $r$ are discussed in \textcite{loRIF}.
+
+\subsection{Woodbury Identity}
+For matrices $A$, $U$, $C$, $V$ of compatible sizes with $A$ and $C$ invertible,
+\begin{equation}
+    (A+UCV)^{-1}=A^{-1}-A^{-1}U\,(C^{-1}+VA^{-1}U)^{-1}\,VA^{-1}.
+\end{equation}
+Set $A=\lambda\mathbb{I}_p$, $U=V_r$, $C=\Sigma_r^2$, and $V=V_r^\top$. Because $V_r^\top V_r=\mathbb{I}_r$, we have $C^{-1}+VA^{-1}U=\Sigma_r^{-2}+\mathbb{I}_r/\lambda$, and therefore
+\begin{equation}
+    (\lambda\mathbb{I}_p+V_r\Sigma_r^2V_r^\top)^{-1}=\frac{1}{\lambda}\mathbb{I}_p-\frac{1}{\lambda^2}\,V_r\Big(\Sigma_r^{-2}+\frac{\mathbb{I}_r}{\lambda}\Big)^{-1}V_r^\top.
+\end{equation}
+Only an $r\times r$ matrix is inverted, and the curvature is stored through $V_r$ and $\Sigma_r$ alone, which needs $O(pr)$ memory instead of $O(p^2)$. Using the damped curvature in the score,
+\begin{equation}\label{eq:damped}
+    I(z,z_{test})\approx\gt{z_{test}}^\top\big(\lambda\mathbb{I}_p+V_r\Sigma_r^2V_r^\top\big)^{-1}\gt{z},
+\end{equation}
+and substituting the Woodbury expansion with $\gtr{\cdot}=V_r^\top\gt{\cdot}$ gives
+\begin{equation}\label{eq:lorif-derived}
+    I(z,z_{test})\approx\frac{1}{\lambda}\gt{z_{test}}^\top\gt{z}-\frac{1}{\lambda^2}\,\gtr{z_{test}}^\top\Big(\Sigma_r^{-2}+\frac{\mathbb{I}_r}{\lambda}\Big)^{-1}\gtr{z}.
+\end{equation}
+This is the LoRIF estimator. The storage bounds, the choice of $r$, and the empirical behaviour of the method are beyond the scope of this review; see \textcite{loRIF}.
+
+
+\section{Literature Reviews}
+
+
+\subsection{Influence Functions 2017}
+\textcite{influence-functions-2017} introduced influence functions as a principled method for explaining black-box machine learning models by tracing a prediction back to the training examples that most influenced it. Influence functions originate from robust statistics and quantify how model parameters change when a training point is infinitesimally upweighted. Given an empirical risk minimizer $\hth$, the influence of a training sample $z$ on the model parameters is defined as
+
+\begin{equation}\label{eq:lit-up-params}
+    I_{up,params}(z)
+    =
+    \frac{d\hth_{\epsilon}}{d\epsilon}
+    \Big|_{\epsilon=0}
+    =
+    -\Hh^{-1}\gr{z},
+\end{equation}
+
+where $\Hh$ is the Hessian of the empirical risk and $\Hh^{-1}$ is its inverse. The corresponding influence on a test loss $L(z_{test},\hth)$ is
+
+\begin{equation}\label{eq:lit-up-loss}
+    I_{up,loss}(z,z_{test}) = -\gr{z_{test}}^\top\Hh^{-1}\gr{z}.
+\end{equation}
+
+To make these computations practical for modern machine learning models, the authors developed efficient approximations using Hessian-vector products, conjugate gradients, and stochastic estimation, reducing the need for explicit Hessian inversion. Experimental results demonstrated that influence-function estimates closely matched leave-one-out retraining, even for large neural networks and even when convexity and differentiability assumptions are violated. They demonstrate applications including debugging mislabeled data, understanding model behavior, and crafting visually indistinguishable adversarial training examples that flip test predictions highlighting both interpretability and security implications. The significance of this work lies in providing a scalable framework for model interpretability, enabling practitioners to identify influential training samples, detect mislabeled data, diagnose distribution shifts, understand model behavior, and assess vulnerabilities to data-poisoning attacks. The authors note limitations such as reliance on local quadratic approximations, challenges with non‑differentiable losses, and computational cost for very large models. They suggest future work on improving stability for deep networks, extending influence analysis to broader model classes, and developing more scalable approximations for modern large scale training regimes.
+
+
+\subsection{TracIn 2020}
+\textcite{tracein} introduced the task of fact tracing, which aims to identify the specific training examples responsible for teaching a language model a particular factual assertion. Building upon classical influence functions proposed by \textcite{influence-functions-2017}, the authors investigate whether TDA methods can effectively trace factual knowledge in LLMs. Influence functions estimate the effect of a training example $z$ on a test example $z_{test}$ using
+\begin{equation}\label{eq:lit-tracin-if}
+    I(z,z_{test}) = \gr{z_{test}}^\top\Hh^{-1}\gr{z},
+\end{equation}
+
+where $\Hh$ is the Hessian of the empirical risk. However, directly computing the inverse Hessian is computationally prohibitive for modern language models with parameters in the orders of billions. The key contribution of this paper is addressing this limitation, the paper presents TracIn, which replaces the Hessian computation with gradient similarity across training checkpoints. TracIn uses a first‑order approximation, where at each training step, it computes the dot‑product between the gradient on the test point and the gradient on the training point, accumulating these contributions across checkpoints. A practical variant, TracIn‑CP, uses saved model checkpoints to approximate the training trajectory, making the method scalable to deep networks. The gradient similarity across training checkpoints is given by
+
+\begin{equation}\label{eq:lit-tracin}
+    I_{\mathrm{TracIn}}(z,z_{test}) = \sum^K_{k=1} \nabla_\theta L(z_{test}, \theta_{t_k})^\top \nabla_\theta L(z, \theta_{t_k})
+\end{equation}
+
+The authors make several improvements to attribution methods, including gradient normalization, optimizer-aware scaling using Adafactor statistics, checkpoint selection strategies, and layer-wise attribution analysis. Experimental results show that these optimizations substantially improve retrieval performance, while revealing that existing influence-based methods still struggle on realistic factual tracing benchmarks and often underperform a simple BM25 retrieval baseline. Particularly, experiments on CIFAR‑10, MNIST, DBPedia, and ImageNet show that TracIn effectively identifies mislabeled data, distinguishes proponents and opponents, and scales to large models where influence functions become infeasible. A later improvement \parencite{rapidin}, TracIn‑LN, applies layer normalization to gradient vectors, reducing sensitivity to sequence length and stabilizing influence scores, especially important for NLP models.
+
+Limitations of TracIn include reliance on stored checkpoints, sensitivity to learning‑rate choice, and the fact that TracIn approximates influence only along the observed training path rather than true counterfactual retraining. Future work suggested by the authors includes refining checkpoint selection, extending the method to more complex optimizers, and improving robustness of the first order approximation for large scale, noisy training regimes.
+
+Nevertheless, on their synthetic benchmark, optimized TracIn achieved near-perfect retrieval performance (MRR $\approx$ 100), demonstrating that attribution methods can successfully trace factual knowledge when issues such as knowledge saturation and lexical overlap are controlled. The significance of this work lies in establishing the first quantitative benchmark for fact tracing, highlighting the limitations of current influence-function approaches, and providing practical directions for developing more reliable methods for understanding where LLMs acquire their factual knowledge.
+
+\subsection{LoRIF 2026}
+\textcite{loRIF} introduce LoRIF (Low-Rank Influence Functions) a framework that extends influence-function-based methods to frontier-scale LLMs by addressing the major storage, memory, and latency bottlenecks of prior approaches such as TRAK \parencite{trak}, LoGRA \parencite{logra}, and TrackStar \parencite{trackstar}. Building on the classical influence function formulation,
+
+\begin{equation}\label{eq:lit-lorif-if}
+    I(z,z_{test}) = \gr{z_{test}}^\top\Hh^{-1}\gr{z},
+\end{equation}
+where $\gr{z}$ and $\gr{z_{test}}$ are training and test gradients and $\Hh$ is the Hessian, LoRIF leverages the observation that neural network gradients exhibit strong low-rank structure. The method introduces two key innovations: (1) low-rank factorization of projected per-example gradients, reducing storage and query-time I/O from $O(D)$ to $O(c\sqrt{D})$ and (2) a truncated-SVD Hessian approximation combined with the Woodbury identity, reducing the curvature memory requirements from $O(D^2)$ to $O(Dr)$. This yields the scalable influence estimate
+
+\begin{equation}\label{eq:lit-lorif}
+    I(z,z_{test}) \approx \frac{1}{\lambda} \gt{z_{test}}^\top \gt{z} - \frac{1}{\lambda^2} \gtr{z_{test}}^\top \Big(\Sigma_r^{-2} + \frac{\mathbb{I}_r}{\lambda}\Big)^{-1} \gtr{z},
+\end{equation}
+
+where $\gt{\cdot}$ is the random projection of a gradient and $\gtr{\cdot}$ its coordinates in the rank-$r$ subspace (derived in Section~\ref{sec:math}). Experimental results demonstrate substantial scalability gains, including up to 20 times lower storage requirements, 20 times faster query latency, and improved attribution quality compared with LoGRA and TrackStar across models ranging from 124M to 70B parameters. Notably, LoRIF is the most scalable influence-function-style TDA method currently available, enabling practical attribution on models as large as 70B parameters and datasets containing millions of training examples while maintaining or improving attribution quality. The significance of this work lies in pushing gradient-based training data attribution to frontier-scale LLMs, making influence-based auditing, debugging, safety analysis, data valuation, and contamination detection feasible for modern foundation models.
+
+
+
+\printbibliography
+\end{document}
